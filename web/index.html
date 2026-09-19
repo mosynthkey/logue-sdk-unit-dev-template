@@ -3,6 +3,15 @@
 <head>
   <meta charset="utf-8">
   <title>logue SDK unit</title>
+  <script>
+    const coepCredentiallessSupported = typeof CSS !== "undefined"
+      && CSS.supports("cross-origin-embedder-policy", "credentialless");
+    window.coi = {
+      coepCredentialless: () => coepCredentiallessSupported,
+      coepDegrade: () => !coepCredentiallessSupported,
+      quiet: true,
+    };
+  </script>
   <script src="./coi-serviceworker.js"></script>
   <style>
     #sim-frame {
@@ -44,6 +53,7 @@
       NTS3_KAOSS,
     } from "./nts1-midi.js";
 
+    async function main() {
     const TARGETS = {
       "nts-1_mkii": {
         label: "NTS-1 mkII",
@@ -295,6 +305,9 @@
       available.find((entry) => entry.simExists) ||
       available[0];
     selectTarget(initial.targetId);
+    }
+
+    await main();
   </script>
 </body>
 </html>
