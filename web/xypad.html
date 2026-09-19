@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>NTS-3 simulator</title>
+  <script src="./coi-serviceworker.js"></script>
+</head>
+<body>
+  <p><a href="../../index.html">Back</a></p>
+  <h1>NTS-3</h1>
+  <p>
+    <button id="TogglePlaybackButton">Start audio</button>
+    Volume <input type="range" min="0" max="1" value="0.5" step="0.01" id="VolumeSlider">
+    <span id="VolumeLabel"></span>
+    BPM <input type="range" min="30" max="240" value="120" step="1" id="BpmSlider">
+    <span id="BpmLabel"></span>
+  </p>
+  <p>
+    Dry input
+    <select id="OscillatorType">
+      <option value="sawtooth">Sawtooth</option>
+      <option value="square">Square</option>
+      <option value="triangle">Triangle</option>
+      <option value="sine">Sine</option>
+      <option value="noise">Noise</option>
+    </select>
+    <button id="TestToneButton">Test Tone Off</button>
+  </p>
+  <p>
+    Depth <input type="range" min="0" max="1" value="1" step="0.001" id="DepthSlider">
+    <button id="XYPadHold">Hold Off</button>
+  </p>
+  <canvas id="XYPad" width="360" height="240" style="border: 1px solid #000;"></canvas>
+  <p>Pad: X = pitch, Y = level. Hold to keep the note.</p>
+  <canvas id="TimeDomain" width="512" height="96"></canvas>
+  <h2>Parameters</h2>
+  <div id="Parameters"></div>
+  <script>
+    window.setupWebAudioAndUI = function (context, wasmProcessor) {
+      const AHREnvelopeTime = 0.05;
+
+      function createSlider(param, mapping, index) {
+        const container = document.createElement("div");
+        const label = document.createElement("label");
+        label.textContent = param.name + " ";
+        const paramSlider = document.createElement("input");
+        paramSlider.type = "range";
+        paramSlider.min = param.min;
+        paramSlider.max = param.max;
+        paramSlider.step = 1;
+        paramSlider.value = param.init;
+        const valueString = document.createElement("span");
+        valueString.textContent = Module.getParameterValueString(index, paramSlider.value);
+        const audioParameter = wasmProcessor.parameters.get(String(index));
+        paramSlider.oninput = () => {
+          valueString.textContent = Module.getParameterValueString(index, paramSlider.value);
+          audioParameter.value = paramSlider.value;
+        };
+        container.appendChild(label);
+        container.appendChild(paramSlider);
+        container.appendChild(valueString);
+        document.getElementById("Parameters").appendChild(container);
+
+        if (mapping.assign === Module.ParamAssign.Depth) {
+          const depthSlider = document.getElementById("DepthSlider");
+          paramSlider.value = mapping.init;
+          depthSlider.addEventListener("input", () => {
+            const curved = Module.applyCurveToParameter0to1(depthSlider.value, mapping.curve, mapping.unipolar);
+            paramSlider.value = curved * (mapping.max - mapping.min) + mapping.min;
+            paramSlider.dispatchEvent(new Event("input"));
+          });
+        }
+      }
+
+      const oscillator = new OscillatorNode(context, { frequency: 440.0 });
+      const envelope = new GainNode(context, { gain: 0.0 });
+      const volume = new GainNode(context, { gain: 0.1 });
+      const analyser = new AnalyserNode(context, { fftSize: 2048 });
+      const data = new Float32Array(analyser.fftSize);
+      const mixGain = new GainNode(context, { gain: 1.0 });
+      const noise = new AudioBufferSourceNode(context, { loop: true });
+      noise.buffer = context.createBuffer(1, context.sampleRate, context.sampleRate);
+      for (let sampleIndex = 0; sampleIndex < context.sampleRate; sampleIndex++) {
+        noise.buffer.getChannelData(0)[sampleIndex] = 2 * Math.random() - 1;
+      }
+      oscillator.connect(envelope).connect(mixGain);
+      mixGain.connect(wasmProcessor).connect(volume);
+      volume.connect(analyser);
+      volume.connect(context.destination);
+
+      let audioSourcesStarted = false;
+      const togglePlaybackButton = document.getElementById("TogglePlaybackButton");
+      function ensureAudioRunning() {
+        if (context.state !== "running") context.resume();
+        if (!audioSourcesStarted) {
+          oscillator.start();
+          noise.start();
+          audioSourcesStarted = true;
+        }
+        togglePlaybackButton.innerText = "Suspend audio";
+      }
+      togglePlaybackButton.onclick = () => {
+        if (context.state !== "running") ensureAudioRunning();
+        else {
+          context.suspend();
+          togglePlaybackButton.innerText = "Start audio";
+        }
+      };
+
+      const volumeSlider = document.getElementById("VolumeSlider");
+      const volumeLabel = document.getElementById("VolumeLabel");
+      volume.gain.value = volumeSlider.value;
+      volumeLabel.innerText = volumeSlider.value;
+      volumeSlider.oninput = function () {
+        volume.gain.value = this.value;
+        volumeLabel.innerText = this.value;
+      };
+
+      const bpmSlider = document.getElementById("BpmSlider");
+      const bpmLabel = document.getElementById("BpmLabel");
+      bpmLabel.innerText = bpmSlider.value;
+      bpmSlider.oninput = function () {
+        bpmLabel.innerText = this.value;
+        Module.fx_set_bpm(this.value);
+      };
+
+      const oscType = document.getElementById("OscillatorType");
+      oscillator.type = oscType.value;
+      oscType.onchange = function () {
+        if (this.value === "noise") {
+          noise.connect(envelope);
+          oscillator.disconnect(envelope);
+        } else {
+          oscillator.type = this.value;
+          oscillator.connect(envelope);
+          noise.disconnect(envelope);
+        }
+      };
+
+      let testToneEnabled = false;
+      document.getElementById("TestToneButton").onclick = function () {
+        ensureAudioRunning();
+        testToneEnabled = !testToneEnabled;
+        this.innerText = "Test Tone " + (testToneEnabled ? "On" : "Off");
+        envelope.gain.cancelAndHoldAtTime(context.currentTime);
+        envelope.gain.linearRampToValueAtTime(testToneEnabled ? 1.0 : 0.0, context.currentTime + AHREnvelopeTime);
+      };
+
+      const canvasWave = document.getElementById("TimeDomain");
+      const canvasWaveContext = canvasWave.getContext("2d");
+      function draw() {
+        analyser.getFloatTimeDomainData(data);
+        canvasWaveContext.clearRect(0, 0, canvasWave.width, canvasWave.height);
+        canvasWaveContext.beginPath();
+        for (let sampleIndex = 0; sampleIndex < data.length; sampleIndex++) {
+          const x = sampleIndex * canvasWave.width / data.length;
+          const y = (1 - data[sampleIndex]) * canvasWave.height / 2;
+          if (sampleIndex === 0) canvasWaveContext.moveTo(x, y);
+          else canvasWaveContext.lineTo(x, y);
+        }
+        canvasWaveContext.stroke();
+        requestAnimationFrame(draw);
+      }
+      draw();
+
+      const xyPad = document.getElementById("XYPad");
+      let xyPadHold = false;
+      let lastXYPadEvent = { clientX: 0, clientY: 0 };
+      document.getElementById("XYPadHold").onclick = function () {
+        xyPadHold = !xyPadHold;
+        this.innerText = "Hold " + (xyPadHold ? "On" : "Off");
+        if (!xyPadHold) updateXYPad(lastXYPadEvent, Module.TouchEvent.Ended);
+      };
+
+      function updateXYPad(event, phase) {
+        lastXYPadEvent = event;
+        const rect = xyPad.getBoundingClientRect();
+        const x = Math.min(Math.max(event.clientX - rect.left, 0), xyPad.width);
+        const y = Math.min(Math.max(event.clientY - rect.top, 0), xyPad.height);
+        Module.touchEvent(phase, x / xyPad.width, y / xyPad.height);
+        const ctx = xyPad.getContext("2d");
+        ctx.clearRect(0, 0, xyPad.width, xyPad.height);
+        if (phase !== Module.TouchEvent.Ended) {
+          ctx.beginPath();
+          ctx.arc(x, y, 8, 0, 2 * Math.PI);
+          ctx.fill();
+        }
+      }
+
+      xyPad.addEventListener("mousedown", function (event) {
+        ensureAudioRunning();
+        updateXYPad(event, Module.TouchEvent.Began);
+      });
+      xyPad.addEventListener("mousemove", function (event) {
+        if (event.buttons !== 1) return;
+        updateXYPad(event, Module.TouchEvent.Moved);
+      });
+      document.addEventListener("mouseup", function (event) {
+        if (!xyPadHold) updateXYPad(event, Module.TouchEvent.Ended);
+      });
+
+      const parameters = Module.getValidParameters();
+      const mappings = Module.getDefaultMapping();
+      for (let paramIndex = 0; paramIndex < parameters.size(); ++paramIndex) {
+        createSlider(parameters.get(paramIndex), mappings.get(paramIndex), paramIndex);
+      }
+    };
+    window.Module = Object.assign(window.Module || {}, {
+      onAudioReady: window.setupWebAudioAndUI,
+    });
+  </script>
+  {{{ SCRIPT }}}
+</body>
+</html>

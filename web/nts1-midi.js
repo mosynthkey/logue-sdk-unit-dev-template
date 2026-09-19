@@ -1,0 +1,518 @@
+/**
+ * NTS-1 mkII / NTS-3 user-unit transfer via Web MIDI SysEx.
+ *
+ * Message layout follows the public KORG MIDI Implementation documents:
+ *   NTS-1 mkII (2024.04.02): F0 42 3g 00 01 73 <id> <payload...> F7
+ *   NTS-3 kaoss (2024.09.03): F0 42 3g 00 01 72 <id> <payload...> F7
+ * USER SLOT DATA (4AH) carries 7-bit packed host data (NOTE 1).
+ * Payload (8-bit, before packing): little-endian length, CRC-32, then the unit ELF.
+ */
+
+export const KORG_ID = 0x42;
+export const NTS1_MKII = {
+  id: "nts-1_mkii",
+  familyLsb: 0x73,
+  familyMsb: 0x01,
+  family: "NTS-1 digital kit mkII",
+  shortLabel: "NTS-1 mkII",
+  portPattern: /nts-?1/i,
+};
+export const NTS3_KAOSS = {
+  id: "nts-3_kaoss",
+  familyLsb: 0x72,
+  familyMsb: 0x01,
+  family: "NTS-3 kaoss pad kit",
+  shortLabel: "NTS-3",
+  portPattern: /nts-?3/i,
+};
+export const DEVICES = {
+  [NTS1_MKII.id]: NTS1_MKII,
+  [NTS3_KAOSS.id]: NTS3_KAOSS,
+};
+
+export const FAMILY_LSB = NTS1_MKII.familyLsb;
+export const FAMILY_MSB = NTS1_MKII.familyMsb;
+export const USER_SLOT_DATA = 0x4a;
+export const USER_SLOT_STATUS_REQUEST = 0x19;
+export const USER_SLOT_STATUS = 0x49;
+export const USER_API_VERSION_REQUEST = 0x17;
+export const USER_API_VERSION = 0x47;
+export const CLEAR_USER_SLOT = 0x1b;
+
+export const STATUS = {
+  0x22: "Invalid request",
+  0x23: "Operation completed",
+  0x24: "Device busy",
+  0x25: "Flash error",
+  0x26: "Data format error",
+  0x27: "User data size error",
+  0x28: "User data CRC error",
+  0x29: "User target error",
+  0x2a: "User API error",
+  0x2b: "User load size error",
+  0x2c: "User module error",
+  0x2d: "User slot error",
+  0x2e: "User format error",
+  0x2f: "User internal error",
+  0x30: "Unit header format error",
+  0x31: "Unit parameter descriptor format error",
+  0x32: "Unit missing required APIs",
+};
+
+export const MODULE_IDS = { modfx: 1, delfx: 2, revfx: 3, osc: 4, genericfx: 7 };
+export const MODULE_SLOTS = { modfx: 16, osc: 16, delfx: 8, revfx: 8, genericfx: 50 };
+export const UNIT_NAME_SIZE = 20;
+export const UNIT_HEADER_NAME_OFFSET = 24;
+
+// Exclusive message must stay within 4096 bytes including F0/F7.
+const MAX_MSG_SIZE = 4096;
+const SYSEX_OVERHEAD = 12; // F0 + header(5) + id + module + slot + seq + seqMax + F7
+const MAX_MIDI_DATA_SIZE = MAX_MSG_SIZE - SYSEX_OVERHEAD;
+export const MAX_HOST_DATA_SIZE = 3573; // 7 host bytes pack into 8 MIDI bytes
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let tableIndex = 0; tableIndex < 256; tableIndex++) {
+    let entry = tableIndex;
+    for (let bitIndex = 0; bitIndex < 8; bitIndex++) {
+      entry = entry & 1 ? (entry >>> 1) ^ 0xedb88320 : entry >>> 1;
+    }
+    table[tableIndex] = entry >>> 0;
+  }
+  return table;
+})();
+
+export function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (let byteIndex = 0; byteIndex < bytes.length; byteIndex++) {
+    crc = CRC32_TABLE[(crc ^ bytes[byteIndex]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+/** KORG NOTE 1: 8-bit host bytes -> 7-bit MIDI bytes (7 host -> 8 MIDI). */
+export function hostToMidi(hostBytes) {
+  const midiBytes = [];
+  for (let blockStart = 0; blockStart < hostBytes.length; blockStart += 7) {
+    const blockEnd = Math.min(blockStart + 7, hostBytes.length);
+    let msbits = 0;
+    const stored = [];
+    for (let byteIndex = blockStart; byteIndex < blockEnd; byteIndex++) {
+      const value = hostBytes[byteIndex];
+      const bitOffset = byteIndex - blockStart;
+      msbits |= (value & 0x80) >> (7 - bitOffset);
+      stored.push(value & 0x7f);
+    }
+    midiBytes.push(msbits, ...stored);
+  }
+  return midiBytes;
+}
+
+export function midiToHost(midiBytes) {
+  const hostBytes = [];
+  for (let blockStart = 0; blockStart < midiBytes.length; blockStart += 8) {
+    const msbits = midiBytes[blockStart];
+    const blockEnd = Math.min(blockStart + 8, midiBytes.length);
+    for (let midiIndex = blockStart + 1; midiIndex < blockEnd; midiIndex++) {
+      const bitOffset = midiIndex - blockStart - 1;
+      const highBit = (msbits & (1 << bitOffset)) << (7 - bitOffset);
+      hostBytes.push(midiBytes[midiIndex] | highBit);
+    }
+  }
+  return hostBytes;
+}
+
+export function resolveDevice(device = NTS1_MKII) {
+  if (typeof device === "string") {
+    return DEVICES[device] || NTS1_MKII;
+  }
+  return device || NTS1_MKII;
+}
+
+export function deviceFromFamily(familyLsb, familyMsb) {
+  for (const device of Object.values(DEVICES)) {
+    if (device.familyLsb === familyLsb && device.familyMsb === familyMsb) {
+      return device;
+    }
+  }
+  return null;
+}
+
+export function exclusiveHeader(channel, device = NTS1_MKII) {
+  const resolved = resolveDevice(device);
+  const channelNibble = Math.max(0, Math.min(15, (channel || 1) - 1));
+  return [KORG_ID, 0x30 | channelNibble, 0x00, 0x01, resolved.familyLsb];
+}
+
+export function isDeviceExclusive(data, device = NTS1_MKII) {
+  const resolved = resolveDevice(device);
+  return (
+    data.length >= 6 &&
+    data[0] === 0xf0 &&
+    data[1] === KORG_ID &&
+    (data[2] & 0xf0) === 0x30 &&
+    data[3] === 0x00 &&
+    data[4] === 0x01 &&
+    data[5] === resolved.familyLsb
+  );
+}
+
+export function isNts1Mk2Exclusive(data) {
+  return isDeviceExclusive(data, NTS1_MKII);
+}
+
+function identityFamilyOffset(data) {
+  const candidates = [];
+  if (data.length >= 15 && data[5] === 0x00 && data[6] === 0x00 && data[7] === KORG_ID) {
+    candidates.push(8);
+  }
+  if (data.length >= 13 && data[5] === KORG_ID) {
+    candidates.push(6);
+  }
+  for (const familyOffset of candidates) {
+    if (deviceFromFamily(data[familyOffset], data[familyOffset + 1])) {
+      return familyOffset;
+    }
+  }
+  return -1;
+}
+
+export function isInquiryReply(data) {
+  return (
+    data.length >= 13 &&
+    data[0] === 0xf0 &&
+    data[1] === 0x7e &&
+    data[3] === 0x06 &&
+    data[4] === 0x02 &&
+    data[data.length - 1] === 0xf7 &&
+    identityFamilyOffset(data) >= 0
+  );
+}
+
+export function parseIdentityReply(data) {
+  const familyOffset = identityFamilyOffset(data);
+  if (familyOffset < 0) {
+    return null;
+  }
+  const modelOffset = familyOffset + 2;
+  if (modelOffset + 3 >= data.length) {
+    return null;
+  }
+  const device = deviceFromFamily(data[familyOffset], data[familyOffset + 1]);
+  const modelNumber = data[modelOffset] | (data[modelOffset + 1] << 8);
+  const softwareVersion = data[modelOffset + 2] | (data[modelOffset + 3] << 8);
+  const deviceIdByte = data[2];
+  const midiChannel = deviceIdByte >= 0 && deviceIdByte <= 15 ? deviceIdByte + 1 : null;
+  return {
+    manufacturer: "KORG",
+    family: device.family,
+    deviceId: device.id,
+    shortLabel: device.shortLabel,
+    modelNumber,
+    softwareVersion,
+    midiChannel,
+    label: `${device.shortLabel} · model ${modelNumber} · v${softwareVersion >> 8}.${softwareVersion & 0xff}`,
+    raw: data,
+  };
+}
+
+export function buildSysex(channel, commandId, payload = [], device = NTS1_MKII) {
+  return Uint8Array.from([0xf0, ...exclusiveHeader(channel, device), commandId, ...payload, 0xf7]);
+}
+
+export function wrapUnitFile(unitBytes) {
+  const source = unitBytes instanceof Uint8Array ? unitBytes : new Uint8Array(unitBytes);
+  const wrapped = new Uint8Array(8 + source.length);
+  const length = source.length;
+  const checksum = crc32(source);
+  wrapped[0] = length & 0xff;
+  wrapped[1] = (length >>> 8) & 0xff;
+  wrapped[2] = (length >>> 16) & 0xff;
+  wrapped[3] = (length >>> 24) & 0xff;
+  wrapped[4] = checksum & 0xff;
+  wrapped[5] = (checksum >>> 8) & 0xff;
+  wrapped[6] = (checksum >>> 16) & 0xff;
+  wrapped[7] = (checksum >>> 24) & 0xff;
+  wrapped.set(source, 8);
+  return wrapped;
+}
+
+export function buildUserSlotDataPackets(unitBytes, { module = "osc", slot = 0, channel = 1, device = NTS1_MKII } = {}) {
+  const moduleId = MODULE_IDS[module];
+  if (moduleId === undefined) {
+    throw new Error(`Unknown module "${module}"`);
+  }
+  const slotCount = MODULE_SLOTS[module];
+  if (slot < 0 || slot >= slotCount) {
+    throw new Error(`Slot ${slot} is out of range for ${module} (0-${slotCount - 1})`);
+  }
+
+  const programData = wrapUnitFile(unitBytes);
+  const sequenceMax = Math.max(0, Math.ceil(programData.length / MAX_HOST_DATA_SIZE) - 1);
+  const packets = [];
+
+  for (let sequenceNum = 0; sequenceNum <= sequenceMax; sequenceNum++) {
+    const chunkStart = sequenceNum * MAX_HOST_DATA_SIZE;
+    const chunkEnd = Math.min(chunkStart + MAX_HOST_DATA_SIZE, programData.length);
+    const chunk = programData.subarray(chunkStart, chunkEnd);
+    const payload = [moduleId, slot, sequenceNum, sequenceMax, ...hostToMidi(chunk)];
+    const message = buildSysex(channel, USER_SLOT_DATA, payload, device);
+    if (message.length > MAX_MSG_SIZE) {
+      throw new Error(`SysEx packet ${sequenceNum} is ${message.length} bytes (max ${MAX_MSG_SIZE})`);
+    }
+    packets.push(message);
+  }
+
+  return packets;
+}
+
+function commandIdFrom(data) {
+  for (const device of Object.values(DEVICES)) {
+    if (isDeviceExclusive(data, device)) {
+      return data[6];
+    }
+  }
+  return null;
+}
+
+export function describeStatus(data) {
+  const commandId = commandIdFrom(data);
+  if (commandId === null) {
+    return null;
+  }
+  if (STATUS[commandId]) {
+    return { id: commandId, ok: commandId === 0x23, message: STATUS[commandId] };
+  }
+  return { id: commandId, ok: false, message: `Unexpected SysEx 0x${commandId.toString(16)}` };
+}
+
+function waitForSysex(input, predicate, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      input.removeEventListener("midimessage", onMessage);
+      reject(new Error("Timed out waiting for SysEx reply"));
+    }, timeoutMs);
+
+    function onMessage(event) {
+      const data = event.data instanceof Uint8Array ? event.data : new Uint8Array(event.data);
+      if (data.length === 0 || data[0] !== 0xf0) {
+        return;
+      }
+      if (!predicate(data)) {
+        return;
+      }
+      clearTimeout(timer);
+      input.removeEventListener("midimessage", onMessage);
+      resolve(data);
+    }
+
+    input.addEventListener("midimessage", onMessage);
+  });
+}
+
+export async function requestIdentity(output, input, { channel = null, timeoutMs = 1500 } = {}) {
+  // Prefer broadcast inquiry (0x7F). Fall back to per-channel probes if needed.
+  const attempts = [];
+  if (channel != null) {
+    attempts.push({ deviceId: Math.max(0, Math.min(15, channel - 1)), timeoutMs });
+  }
+  attempts.push({ deviceId: 0x7f, timeoutMs });
+  for (let channelIndex = 0; channelIndex < 16; channelIndex += 1) {
+    attempts.push({ deviceId: channelIndex, timeoutMs: 250 });
+  }
+
+  let lastError = null;
+  for (const attempt of attempts) {
+    try {
+      const identityRequest = Uint8Array.from([0xf0, 0x7e, attempt.deviceId, 0x06, 0x01, 0xf7]);
+      const pending = waitForSysex(input, isInquiryReply, attempt.timeoutMs);
+      output.send(identityRequest);
+      const reply = await pending;
+      const identity = parseIdentityReply(reply);
+      if (!identity) {
+        throw new Error("Unrecognized device identity reply");
+      }
+      if (identity.midiChannel == null && attempt.deviceId <= 15) {
+        identity.midiChannel = attempt.deviceId + 1;
+      }
+      return identity;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error("Timed out waiting for SysEx reply");
+}
+
+export async function detectDevice(output, input, { channel = null, timeoutMs = 1500 } = {}) {
+  if (!output || !input) {
+    throw new Error("MIDI ports are not available");
+  }
+  return requestIdentity(output, input, { channel, timeoutMs });
+}
+
+function moduleNameFromId(moduleId) {
+  for (const [name, id] of Object.entries(MODULE_IDS)) {
+    if (id === moduleId) {
+      return name;
+    }
+  }
+  return String(moduleId);
+}
+
+function readUint32LE(bytes, offset) {
+  return (
+    (bytes[offset] |
+      (bytes[offset + 1] << 8) |
+      (bytes[offset + 2] << 16) |
+      (bytes[offset + 3] << 24)) >>>
+    0
+  );
+}
+
+export function decodeUnitName(bytes) {
+  const chars = [];
+  const source = bytes instanceof Uint8Array ? bytes : Uint8Array.from(bytes);
+  for (let byteIndex = 0; byteIndex < source.length; byteIndex++) {
+    const code = source[byteIndex];
+    if (code === 0) {
+      break;
+    }
+    if (code >= 32 && code < 127) {
+      chars.push(String.fromCharCode(code));
+    }
+  }
+  return chars.join("").trim();
+}
+
+export function parseSlotStatusReply(data) {
+  if (commandIdFrom(data) !== USER_SLOT_STATUS) {
+    throw new Error("Not a USER SLOT STATUS reply");
+  }
+  const payload = Array.from(data.slice(7, data.length - 1));
+  const moduleId = payload[0];
+  const slot = payload[1];
+  const module = moduleNameFromId(moduleId);
+  if (payload.length <= 2) {
+    return { module, slot, empty: true, name: "", raw: payload };
+  }
+
+  const headerBytes = midiToHost(payload.slice(3));
+  const elfName =
+    headerBytes.length >= UNIT_HEADER_NAME_OFFSET + UNIT_NAME_SIZE
+      ? decodeUnitName(headerBytes.slice(UNIT_HEADER_NAME_OFFSET, UNIT_HEADER_NAME_OFFSET + UNIT_NAME_SIZE))
+      : "";
+  const tableName = headerBytes.length >= 32 ? decodeUnitName(headerBytes.slice(18, 32)) : "";
+  const name = elfName || tableName;
+  const headerSize = headerBytes.length >= 4 ? readUint32LE(headerBytes, 0) : 0;
+  return {
+    module,
+    slot,
+    empty: false,
+    name,
+    headerSize,
+    raw: payload,
+  };
+}
+
+export async function readSlotStatus(output, input, { module = "osc", slot = 0, channel = 1, timeoutMs = 2000, device = NTS1_MKII } = {}) {
+  const moduleId = MODULE_IDS[module];
+  if (moduleId === undefined) {
+    throw new Error(`Unknown module "${module}"`);
+  }
+  const request = buildSysex(channel, USER_SLOT_STATUS_REQUEST, [moduleId, slot], device);
+  const pending = waitForSysex(
+    input,
+    (data) => {
+      if (commandIdFrom(data) !== USER_SLOT_STATUS) {
+        return false;
+      }
+      const payload = data.slice(7, data.length - 1);
+      return payload.length >= 2 && payload[0] === moduleId && payload[1] === slot;
+    },
+    timeoutMs,
+  );
+  output.send(request);
+  return parseSlotStatusReply(await pending);
+}
+
+export async function readModuleSlots(output, input, { module = "osc", channel = 1, timeoutMs = 800, device = NTS1_MKII } = {}) {
+  const slotCount = MODULE_SLOTS[module] || 0;
+  const slots = [];
+  for (let slotIndex = 0; slotIndex < slotCount; slotIndex++) {
+    slots.push(await readSlotStatus(output, input, { module, slot: slotIndex, channel, timeoutMs, device }));
+  }
+  return slots;
+}
+
+export async function installUnit(output, input, unitBytes, options = {}) {
+  const {
+    module = "osc",
+    slot = 0,
+    channel = 1,
+    timeoutMs = 8000,
+    device = NTS1_MKII,
+    onProgress = () => {},
+  } = options;
+  const resolved = resolveDevice(device);
+
+  const packets = buildUserSlotDataPackets(unitBytes, { module, slot, channel, device: resolved });
+  onProgress({ phase: "start", packetIndex: 0, packetCount: packets.length });
+
+  for (let packetIndex = 0; packetIndex < packets.length; packetIndex++) {
+    const pending = waitForSysex(
+      input,
+      (data) => commandIdFrom(data) !== null && STATUS[commandIdFrom(data)] !== undefined,
+      timeoutMs,
+    );
+    output.send(packets[packetIndex]);
+    const reply = await pending;
+    const status = describeStatus(reply);
+    onProgress({
+      phase: "packet",
+      packetIndex: packetIndex + 1,
+      packetCount: packets.length,
+      status,
+    });
+    if (!status.ok) {
+      throw new Error(`${resolved.shortLabel} rejected packet ${packetIndex + 1}/${packets.length}: ${status.message}`);
+    }
+  }
+
+  onProgress({ phase: "done", packetIndex: packets.length, packetCount: packets.length });
+  return { packetCount: packets.length };
+}
+
+export function looksLikeNts1Name(name) {
+  return NTS1_MKII.portPattern.test(name || "");
+}
+
+export function looksLikeDevicePort(name, device = NTS1_MKII) {
+  return resolveDevice(device).portPattern.test(name || "");
+}
+
+export function listMidiPorts(ports) {
+  if (ports && typeof ports.values === "function") {
+    return Array.from(ports.values());
+  }
+  return Array.from(ports || []);
+}
+
+export function portLabel(port) {
+  if (!port) {
+    return "Unknown MIDI port";
+  }
+  return port.name || port.id || "Unknown MIDI port";
+}
+
+export function pickPreferredPort(ports, device = NTS1_MKII) {
+  const listed = listMidiPorts(ports);
+  const matched = listed.filter((port) => looksLikeDevicePort(port.name, device));
+  if (matched.length >= 2) {
+    return matched[matched.length - 1];
+  }
+  if (matched.length === 1) {
+    return matched[0];
+  }
+  return listed[0] || null;
+}

@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>logue SDK unit</title>
+  <script src="./coi-serviceworker.js"></script>
+</head>
+<body>
+  <h1 id="plugin-name">Loading</h1>
+  <p id="plugin-description"></p>
+  <p id="status">Open this page in Chrome or Edge. Web MIDI SysEx is required to send a unit to hardware.</p>
+
+  <h2>Simulator</h2>
+  <p id="sim-links">Simulator files are not here yet. Merge to main so GitHub Actions can build them, or run <code>make site</code> locally.</p>
+
+  <h2>Send to hardware</h2>
+  <p>Connect NTS-1 mkII or NTS-3 over USB. Pick a slot, then send. Chrome / Edge only.</p>
+  <div id="send-panels"></div>
+
+  <h2>Download</h2>
+  <p id="download-links"></p>
+
+  <script type="module">
+    import {
+      detectDevice,
+      installUnit,
+      pickPreferredPort,
+      portLabel,
+      readModuleSlots,
+      NTS1_MKII,
+      NTS3_KAOSS,
+    } from "./nts1-midi.js";
+
+    const TARGETS = {
+      "nts-1_mkii": {
+        label: "NTS-1 mkII",
+        module: "osc",
+        suffix: ".nts1mkiiunit",
+        device: NTS1_MKII,
+        simDir: "sim/nts-1_mkii",
+      },
+      "nts-3_kaoss": {
+        label: "NTS-3",
+        module: "genericfx",
+        suffix: ".nts3unit",
+        device: NTS3_KAOSS,
+        simDir: "sim/nts-3_kaoss",
+      },
+    };
+
+    const plugin = await fetch("./plugin.json").then((response) => response.json());
+    document.title = plugin.name;
+    document.getElementById("plugin-name").textContent = plugin.name;
+    document.getElementById("plugin-description").textContent = plugin.description || "";
+
+    const simLinks = document.getElementById("sim-links");
+    const downloadLinks = document.getElementById("download-links");
+    const sendPanels = document.getElementById("send-panels");
+    let builds = [];
+    try {
+      builds = (await fetch("./builds.json").then((response) => {
+        if (!response.ok) throw new Error("no builds");
+        return response.json();
+      })).builds || [];
+    } catch (error) {
+      builds = [];
+    }
+
+    const available = [];
+    for (const targetId of plugin.targets || []) {
+      const target = TARGETS[targetId];
+      if (!target) continue;
+      const unitHref = `./units/${plugin.id}${target.suffix}`;
+      const simHref = `./${target.simDir}/${plugin.id}.html`;
+      const build = builds.find((entry) => entry.target === targetId);
+      available.push({
+        targetId,
+        target,
+        unitHref: build && build.unit ? build.unit : unitHref,
+        simHref: build && build.wasm ? build.wasm : simHref,
+        unitExists: Boolean(build && build.unit),
+        simExists: Boolean(build && build.wasm),
+      });
+    }
+
+    const simItems = available.filter((entry) => entry.simExists);
+    if (simItems.length > 0) {
+      simLinks.replaceChildren();
+      for (const entry of simItems) {
+        const link = document.createElement("a");
+        link.href = entry.simHref;
+        link.textContent = entry.target.label + " simulator";
+        simLinks.appendChild(link);
+        simLinks.appendChild(document.createElement("br"));
+      }
+    }
+
+    const unitItems = available.filter((entry) => entry.unitExists);
+    if (unitItems.length === 0) {
+      downloadLinks.textContent = "Unit files are not here yet.";
+    } else {
+      for (const entry of unitItems) {
+        const link = document.createElement("a");
+        link.href = entry.unitHref;
+        link.textContent = entry.target.label + " (" + entry.target.suffix + ")";
+        downloadLinks.appendChild(link);
+        downloadLinks.appendChild(document.createElement("br"));
+      }
+    }
+
+    function setLine(element, text) {
+      element.textContent = text;
+    }
+
+    async function requestMidi() {
+      if (!navigator.requestMIDIAccess) {
+        throw new Error("This browser does not support Web MIDI. Use Chrome or Edge.");
+      }
+      return navigator.requestMIDIAccess({ sysex: true });
+    }
+
+    for (const entry of available) {
+      const panel = document.createElement("fieldset");
+      const legend = document.createElement("legend");
+      legend.textContent = entry.target.label;
+      panel.appendChild(legend);
+
+      const connectButton = document.createElement("button");
+      connectButton.type = "button";
+      connectButton.textContent = "Connect";
+      const slotSelect = document.createElement("select");
+      slotSelect.disabled = true;
+      const sendButton = document.createElement("button");
+      sendButton.type = "button";
+      sendButton.textContent = "Send";
+      sendButton.disabled = true;
+      const line = document.createElement("p");
+      line.textContent = entry.unitExists ? "Connect the device, then send." : "Unit file is missing.";
+
+      panel.appendChild(connectButton);
+      panel.appendChild(document.createTextNode(" Slot "));
+      panel.appendChild(slotSelect);
+      panel.appendChild(document.createTextNode(" "));
+      panel.appendChild(sendButton);
+      panel.appendChild(line);
+      sendPanels.appendChild(panel);
+
+      let midiAccess = null;
+      let identity = null;
+
+      connectButton.onclick = async () => {
+        try {
+          setLine(line, "Requesting MIDI access...");
+          midiAccess = await requestMidi();
+          const output = pickPreferredPort(midiAccess.outputs, entry.target.device);
+          const input = pickPreferredPort(midiAccess.inputs, entry.target.device);
+          if (!output || !input) {
+            throw new Error("No MIDI port found. Connect the device over USB.");
+          }
+          setLine(line, "Asking " + portLabel(output) + " for identity...");
+          identity = await detectDevice(output, input);
+          if (identity.deviceId !== entry.target.device.id) {
+            throw new Error("Connected device is " + identity.shortLabel + ", not " + entry.target.label);
+          }
+          const slots = await readModuleSlots(output, input, {
+            module: entry.target.module,
+            channel: identity.midiChannel || 1,
+            device: entry.target.device,
+          });
+          slotSelect.replaceChildren();
+          slots.forEach((slot) => {
+            const option = document.createElement("option");
+            option.value = String(slot.slot);
+            option.textContent = slot.empty
+              ? "Slot " + slot.slot + " (empty)"
+              : "Slot " + slot.slot + " (" + (slot.name || "occupied") + ")";
+            slotSelect.appendChild(option);
+          });
+          slotSelect.disabled = !entry.unitExists;
+          sendButton.disabled = !entry.unitExists;
+          setLine(line, identity.label);
+        } catch (error) {
+          setLine(line, error.message);
+        }
+      };
+
+      sendButton.onclick = async () => {
+        if (!midiAccess || !identity) {
+          setLine(line, "Connect first.");
+          return;
+        }
+        try {
+          const output = pickPreferredPort(midiAccess.outputs, entry.target.device);
+          const input = pickPreferredPort(midiAccess.inputs, entry.target.device);
+          const slot = Number(slotSelect.value);
+          setLine(line, "Fetching unit file...");
+          const unitBytes = new Uint8Array(await (await fetch(entry.unitHref)).arrayBuffer());
+          await installUnit(output, input, unitBytes, {
+            module: entry.target.module,
+            slot,
+            channel: identity.midiChannel || 1,
+            device: entry.target.device,
+            onProgress: (progress) => {
+              if (progress.phase === "packet") {
+                setLine(line, "Sending packet " + progress.packetIndex + "/" + progress.packetCount);
+              }
+            },
+          });
+          setLine(line, "Sent to " + entry.target.label + " slot " + slot + ".");
+        } catch (error) {
+          setLine(line, error.message);
+        }
+      };
+    }
+  </script>
+</body>
+</html>

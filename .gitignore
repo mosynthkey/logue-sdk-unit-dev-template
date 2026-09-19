@@ -1,0 +1,13 @@
+.DS_Store
+dist/
+targets/*/build/
+targets/*/sim/
+targets/*/*.nts1mkiiunit
+targets/*/*.nts3unit
+*.elf
+*.map
+*.hex
+*.bin
+*.dmp
+*.list
+emsdk-cache/

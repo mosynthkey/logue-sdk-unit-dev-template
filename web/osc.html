@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>NTS-1 mkII simulator</title>
+  <script src="./coi-serviceworker.js"></script>
+</head>
+<body>
+  <p><a href="../../index.html">Back</a></p>
+  <h1>NTS-1 mkII</h1>
+  <p>
+    <button id="TogglePlaybackButton">Start audio</button>
+    Volume <input type="range" min="0" max="1" value="0.5" step="0.01" id="VolumeSlider">
+    <span id="VolumeLabel"></span>
+  </p>
+  <p>Click a key or use A S D F G H J K. Z / X change octave.</p>
+  <p>
+    <button type="button" data-note="48">C</button>
+    <button type="button" data-note="50">D</button>
+    <button type="button" data-note="52">E</button>
+    <button type="button" data-note="53">F</button>
+    <button type="button" data-note="55">G</button>
+    <button type="button" data-note="57">A</button>
+    <button type="button" data-note="59">B</button>
+    <button type="button" data-note="60">C</button>
+    <button id="OscLatchButton">Latch Off</button>
+  </p>
+  <canvas id="TimeDomain" width="512" height="96"></canvas>
+  <h2>Parameters</h2>
+  <div id="Parameters"></div>
+  <script>
+    window.setupWebAudioAndUI = function (context, wasmProcessor) {
+      const AHREnvelopeTime = 0.05;
+      const keyButtons = document.querySelectorAll("button[data-note]");
+      const computerKeys = { a: 0, s: 1, d: 2, f: 3, g: 4, h: 5, j: 6, k: 7 };
+      let octaveOffset = 0;
+      let heldNotes = [];
+      let latchEnabled = false;
+      let oscFrequency = 261.63;
+
+      function createSlider(param, index) {
+        const container = document.createElement("div");
+        const label = document.createElement("label");
+        label.textContent = param.name + " ";
+        const input = document.createElement("input");
+        input.type = "range";
+        input.min = param.min;
+        input.max = param.max;
+        input.step = 1;
+        input.value = param.init;
+        const valueString = document.createElement("span");
+        valueString.textContent = Module.getParameterValueString(index, input.value);
+        const audioParameter = wasmProcessor.parameters.get(String(index));
+        input.oninput = () => {
+          valueString.textContent = Module.getParameterValueString(index, input.value);
+          audioParameter.value = input.value;
+        };
+        container.appendChild(label);
+        container.appendChild(input);
+        container.appendChild(valueString);
+        document.getElementById("Parameters").appendChild(container);
+      }
+
+      const envelope = new GainNode(context, { gain: 0.0 });
+      const volume = new GainNode(context, { gain: 0.1 });
+      const analyser = new AnalyserNode(context, { fftSize: 2048 });
+      const data = new Float32Array(analyser.fftSize);
+      wasmProcessor.connect(envelope).connect(volume);
+      volume.connect(analyser);
+      volume.connect(context.destination);
+
+      const togglePlaybackButton = document.getElementById("TogglePlaybackButton");
+      function ensureAudioRunning() {
+        if (context.state !== "running") context.resume();
+        togglePlaybackButton.innerText = "Suspend audio";
+      }
+      togglePlaybackButton.onclick = () => {
+        if (context.state !== "running") ensureAudioRunning();
+        else {
+          context.suspend();
+          togglePlaybackButton.innerText = "Start audio";
+        }
+      };
+
+      const volumeSlider = document.getElementById("VolumeSlider");
+      const volumeLabel = document.getElementById("VolumeLabel");
+      volume.gain.value = volumeSlider.value;
+      volumeLabel.innerText = volumeSlider.value;
+      volumeSlider.oninput = function () {
+        volume.gain.value = this.value;
+        volumeLabel.innerText = this.value;
+      };
+
+      function midiToHz(note) {
+        return 440 * Math.pow(2, (note - 69) / 12);
+      }
+
+      function noteDown(note) {
+        ensureAudioRunning();
+        if (heldNotes.indexOf(note) === -1) heldNotes.push(note);
+        oscFrequency = midiToHz(note);
+        Module.setOscPitch(oscFrequency);
+        Module.noteOn(note, 100);
+        envelope.gain.cancelAndHoldAtTime(context.currentTime);
+        envelope.gain.linearRampToValueAtTime(1.0, context.currentTime + AHREnvelopeTime);
+      }
+
+      function noteUp(note) {
+        const noteIndex = heldNotes.lastIndexOf(note);
+        if (noteIndex >= 0) heldNotes.splice(noteIndex, 1);
+        if (heldNotes.length > 0) {
+          const lastNote = heldNotes[heldNotes.length - 1];
+          oscFrequency = midiToHz(lastNote);
+          Module.setOscPitch(oscFrequency);
+        } else if (!latchEnabled) {
+          envelope.gain.cancelAndHoldAtTime(context.currentTime);
+          envelope.gain.linearRampToValueAtTime(0.0, context.currentTime + AHREnvelopeTime);
+        }
+        Module.noteOff(note);
+      }
+
+      keyButtons.forEach((button) => {
+        const baseNote = Number(button.dataset.note);
+        button.onmousedown = () => noteDown(baseNote + octaveOffset * 12);
+        button.onmouseup = () => noteUp(baseNote + octaveOffset * 12);
+        button.onmouseleave = () => noteUp(baseNote + octaveOffset * 12);
+      });
+
+      document.getElementById("OscLatchButton").onclick = function () {
+        latchEnabled = !latchEnabled;
+        this.innerText = "Latch " + (latchEnabled ? "On" : "Off");
+        if (!latchEnabled && heldNotes.length === 0) {
+          envelope.gain.cancelAndHoldAtTime(context.currentTime);
+          envelope.gain.linearRampToValueAtTime(0.0, context.currentTime + AHREnvelopeTime);
+        }
+      };
+
+      document.addEventListener("keydown", (event) => {
+        if (event.repeat) return;
+        if (event.key === "z") octaveOffset = Math.max(-2, octaveOffset - 1);
+        else if (event.key === "x") octaveOffset = Math.min(3, octaveOffset + 1);
+        const keyOffset = computerKeys[event.key];
+        if (keyOffset === undefined) return;
+        noteDown(48 + keyOffset + octaveOffset * 12);
+      });
+      document.addEventListener("keyup", (event) => {
+        const keyOffset = computerKeys[event.key];
+        if (keyOffset === undefined) return;
+        noteUp(48 + keyOffset + octaveOffset * 12);
+      });
+
+      const canvasWave = document.getElementById("TimeDomain");
+      const canvasWaveContext = canvasWave.getContext("2d");
+      function draw() {
+        analyser.getFloatTimeDomainData(data);
+        canvasWaveContext.clearRect(0, 0, canvasWave.width, canvasWave.height);
+        canvasWaveContext.beginPath();
+        for (let sampleIndex = 0; sampleIndex < data.length; sampleIndex++) {
+          const x = sampleIndex * canvasWave.width / data.length;
+          const y = (1 - data[sampleIndex]) * canvasWave.height / 2;
+          if (sampleIndex === 0) canvasWaveContext.moveTo(x, y);
+          else canvasWaveContext.lineTo(x, y);
+        }
+        canvasWaveContext.stroke();
+        requestAnimationFrame(draw);
+      }
+      draw();
+
+      const parameters = Module.getValidParameters();
+      for (let paramIndex = 0; paramIndex < parameters.size(); ++paramIndex) {
+        createSlider(parameters.get(paramIndex), paramIndex);
+      }
+    };
+    window.Module = Object.assign(window.Module || {}, {
+      onAudioReady: window.setupWebAudioAndUI,
+    });
+  </script>
+  {{{ SCRIPT }}}
+</body>
+</html>
