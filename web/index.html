@@ -4,21 +4,34 @@
   <meta charset="utf-8">
   <title>logue SDK unit</title>
   <script src="./coi-serviceworker.js"></script>
+  <style>
+    #sim-frame {
+      width: 100%;
+      max-width: 720px;
+      height: 640px;
+      border: 1px solid #000;
+      display: none;
+    }
+  </style>
 </head>
 <body>
   <h1 id="plugin-name">Loading</h1>
   <p id="plugin-description"></p>
-  <p id="status">Open this page in Chrome or Edge. Web MIDI SysEx is required to send a unit to hardware.</p>
 
-  <h2>Simulator</h2>
-  <p id="sim-links">Simulator files are not here yet. Merge to main so GitHub Actions can build them, or run <code>make site</code> locally.</p>
-
-  <h2>Send to hardware</h2>
-  <p>Connect NTS-1 mkII or NTS-3 over USB. Pick a slot, then send. Chrome / Edge only.</p>
-  <div id="send-panels"></div>
+  <p>
+    <label for="target-select">Target</label>
+    <select id="target-select"></select>
+  </p>
 
   <h2>Download</h2>
-  <p id="download-links"></p>
+  <p id="download-area">Select a target.</p>
+
+  <h2 id="install-heading">Install</h2>
+  <div id="install-area"></div>
+
+  <h2>Simulator</h2>
+  <p id="sim-status">Select a target.</p>
+  <iframe id="sim-frame" title="Unit simulator"></iframe>
 
   <script type="module">
     import {
@@ -38,6 +51,7 @@
         suffix: ".nts1mkiiunit",
         device: NTS1_MKII,
         simDir: "sim/nts-1_mkii",
+        midiSend: true,
       },
       "nts-3_kaoss": {
         label: "NTS-3",
@@ -45,6 +59,15 @@
         suffix: ".nts3unit",
         device: NTS3_KAOSS,
         simDir: "sim/nts-3_kaoss",
+        midiSend: true,
+      },
+      microkorg2: {
+        label: "microKORG2",
+        module: "osc",
+        suffix: ".mk2unit",
+        device: null,
+        simDir: null,
+        midiSend: false,
       },
     };
 
@@ -53,9 +76,6 @@
     document.getElementById("plugin-name").textContent = plugin.name;
     document.getElementById("plugin-description").textContent = plugin.description || "";
 
-    const simLinks = document.getElementById("sim-links");
-    const downloadLinks = document.getElementById("download-links");
-    const sendPanels = document.getElementById("send-panels");
     let builds = [];
     try {
       builds = (await fetch("./builds.json").then((response) => {
@@ -71,7 +91,7 @@
       const target = TARGETS[targetId];
       if (!target) continue;
       const unitHref = `./units/${plugin.id}${target.suffix}`;
-      const simHref = `./${target.simDir}/${plugin.id}.html`;
+      const simHref = target.simDir ? `./${target.simDir}/${plugin.id}.html` : null;
       const build = builds.find((entry) => entry.target === targetId);
       available.push({
         targetId,
@@ -83,29 +103,24 @@
       });
     }
 
-    const simItems = available.filter((entry) => entry.simExists);
-    if (simItems.length > 0) {
-      simLinks.replaceChildren();
-      for (const entry of simItems) {
-        const link = document.createElement("a");
-        link.href = entry.simHref;
-        link.textContent = entry.target.label + " simulator";
-        simLinks.appendChild(link);
-        simLinks.appendChild(document.createElement("br"));
-      }
+    const targetSelect = document.getElementById("target-select");
+    const downloadArea = document.getElementById("download-area");
+    const installHeading = document.getElementById("install-heading");
+    const installArea = document.getElementById("install-area");
+    const simStatus = document.getElementById("sim-status");
+    const simFrame = document.getElementById("sim-frame");
+
+    if (available.length === 0) {
+      targetSelect.disabled = true;
+      downloadArea.textContent = "No targets listed in plugin.json.";
+      return;
     }
 
-    const unitItems = available.filter((entry) => entry.unitExists);
-    if (unitItems.length === 0) {
-      downloadLinks.textContent = "Unit files are not here yet.";
-    } else {
-      for (const entry of unitItems) {
-        const link = document.createElement("a");
-        link.href = entry.unitHref;
-        link.textContent = entry.target.label + " (" + entry.target.suffix + ")";
-        downloadLinks.appendChild(link);
-        downloadLinks.appendChild(document.createElement("br"));
-      }
+    for (const entry of available) {
+      const option = document.createElement("option");
+      option.value = entry.targetId;
+      option.textContent = entry.target.label;
+      targetSelect.appendChild(option);
     }
 
     function setLine(element, text) {
@@ -119,11 +134,40 @@
       return navigator.requestMIDIAccess({ sysex: true });
     }
 
-    for (const entry of available) {
-      const panel = document.createElement("fieldset");
-      const legend = document.createElement("legend");
-      legend.textContent = entry.target.label;
-      panel.appendChild(legend);
+    function renderDownload(entry) {
+      downloadArea.replaceChildren();
+      if (!entry.unitExists) {
+        downloadArea.textContent =
+          "Unit file is not here yet. Merge to main so GitHub Actions can build it, or run make site locally.";
+        return;
+      }
+      const link = document.createElement("a");
+      link.href = entry.unitHref;
+      link.textContent = entry.target.label + " (" + entry.target.suffix + ")";
+      downloadArea.appendChild(link);
+    }
+
+    function renderMk2Install(entry) {
+      installHeading.textContent = "Install (USB mass storage)";
+      installArea.replaceChildren();
+      const help = document.createElement("p");
+      help.textContent =
+        "Download the .mk2unit above. Power off, hold FUNCTION 1, power on (USB mass storage), copy into an empty folder under Units/Oscs/, eject, press FUNCTION 5, then select the unit on an OSC page. Web SysEx send does not work on microKORG2.";
+      installArea.appendChild(help);
+      if (!entry.unitExists) {
+        const missing = document.createElement("p");
+        missing.textContent = "Unit file is missing.";
+        installArea.appendChild(missing);
+      }
+    }
+
+    function renderMidiInstall(entry) {
+      installHeading.textContent = "Send to hardware";
+      installArea.replaceChildren();
+
+      const intro = document.createElement("p");
+      intro.textContent = "Connect " + entry.target.label + " over USB. Chrome / Edge only.";
+      installArea.appendChild(intro);
 
       const connectButton = document.createElement("button");
       connectButton.type = "button";
@@ -137,13 +181,12 @@
       const line = document.createElement("p");
       line.textContent = entry.unitExists ? "Connect the device, then send." : "Unit file is missing.";
 
-      panel.appendChild(connectButton);
-      panel.appendChild(document.createTextNode(" Slot "));
-      panel.appendChild(slotSelect);
-      panel.appendChild(document.createTextNode(" "));
-      panel.appendChild(sendButton);
-      panel.appendChild(line);
-      sendPanels.appendChild(panel);
+      installArea.appendChild(connectButton);
+      installArea.appendChild(document.createTextNode(" Slot "));
+      installArea.appendChild(slotSelect);
+      installArea.appendChild(document.createTextNode(" "));
+      installArea.appendChild(sendButton);
+      installArea.appendChild(line);
 
       let midiAccess = null;
       let identity = null;
@@ -212,6 +255,46 @@
         }
       };
     }
+
+    function renderSimulator(entry) {
+      simFrame.src = "about:blank";
+      if (!entry.target.simDir) {
+        simFrame.style.display = "none";
+        simStatus.textContent = "No browser simulator for " + entry.target.label + ".";
+        return;
+      }
+      if (!entry.simExists) {
+        simFrame.style.display = "none";
+        simStatus.textContent =
+          "Simulator is not here yet. Merge to main so GitHub Actions can build it, or run make site locally.";
+        return;
+      }
+      simStatus.textContent = entry.target.label + " simulator (Start audio inside the frame).";
+      simFrame.style.display = "block";
+      simFrame.src = entry.simHref;
+    }
+
+    function selectTarget(targetId) {
+      const entry = available.find((item) => item.targetId === targetId);
+      if (!entry) return;
+      targetSelect.value = entry.targetId;
+      const url = new URL(window.location.href);
+      url.searchParams.set("target", entry.targetId);
+      window.history.replaceState({}, "", url);
+      renderDownload(entry);
+      if (entry.target.midiSend) renderMidiInstall(entry);
+      else renderMk2Install(entry);
+      renderSimulator(entry);
+    }
+
+    targetSelect.onchange = () => selectTarget(targetSelect.value);
+
+    const requested = new URLSearchParams(window.location.search).get("target");
+    const initial =
+      available.find((entry) => entry.targetId === requested) ||
+      available.find((entry) => entry.simExists) ||
+      available[0];
+    selectTarget(initial.targetId);
   </script>
 </body>
 </html>

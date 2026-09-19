@@ -120,7 +120,7 @@ public:
   {
     for (uint32_t sampleIndex = 0; sampleIndex < frames; ++sampleIndex)
     {
-      const float wet = tick() * gate_;
+      const float wet = renderSample();
       if (stereo_mix_)
       {
         out[0] = fx::mix(in[0], wet, mix_);
@@ -135,6 +135,11 @@ public:
         in += 2;
       }
     }
+  }
+
+  float renderSample()
+  {
+    return tick() * gate_;
   }
 
 private:

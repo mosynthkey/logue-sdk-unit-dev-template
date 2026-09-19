@@ -4,6 +4,8 @@ targets/*/build/
 targets/*/sim/
 targets/*/*.nts1mkiiunit
 targets/*/*.nts3unit
+targets/*/*.mk2unit
+third_party/logue-sdk/tools/microkorg2-toolchain/
 *.elf
 *.map
 *.hex

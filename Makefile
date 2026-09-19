@@ -1,6 +1,6 @@
 .PHONY: all unit wasm test site preview clean
 
-TARGETS := targets/nts-1_mkii targets/nts-3_kaoss
+TARGETS := targets/nts-1_mkii targets/nts-3_kaoss targets/microkorg2
 
 export GCC_BIN_PATH
 export EMCC_BIN_PATH

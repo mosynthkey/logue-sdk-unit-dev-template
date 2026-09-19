@@ -1,7 +1,7 @@
 {
   "id": "sine",
   "name": "Sine",
-  "targets": ["nts-1_mkii", "nts-3_kaoss"],
+  "targets": ["nts-1_mkii", "nts-3_kaoss", "microkorg2"],
   "description": "Starter oscillator. WAVE selects sine / triangle / square / saw. SHAPE adds a harmonic or changes pulse width. On NTS-3, hold the pad: X is pitch, Y is level, Depth is mix.",
   "params": [
     { "name": "WAVE", "role": "A", "detail": "Sine, triangle, square, saw" },

@@ -32,6 +32,7 @@ plugin = json.loads((root / "plugin.json").read_text())
 suffixes = {
     "nts-1_mkii": ".nts1mkiiunit",
     "nts-3_kaoss": ".nts3unit",
+    "microkorg2": ".mk2unit",
 }
 
 builds = []
