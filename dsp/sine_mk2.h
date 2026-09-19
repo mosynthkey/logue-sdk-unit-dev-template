@@ -4,7 +4,7 @@
  * File: sine_mk2.h
  *
  * microKORG2 multi-voice adapter around the shared Sine processor.
- * Pattern follows my-logue-sdk-units plugins/*/dsp/*_mk2.h.
+ * Same pattern as my-logue-sdk-units plugins/<name>/dsp/<name>_mk2.h.
  */
 
 #include "macros.h"
